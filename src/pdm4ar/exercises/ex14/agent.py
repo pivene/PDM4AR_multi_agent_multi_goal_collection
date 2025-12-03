@@ -1,9 +1,9 @@
-from math import isclose
+from decimal import Decimal
 import random
 from dataclasses import dataclass
 from turtle import position
 from typing import Mapping, Sequence
-
+import math
 import dg_commons
 import numpy as np
 from dg_commons import PlayerName
@@ -40,8 +40,9 @@ class Pdm4arAgent(Agent):
     sg: DiffDriveGeometry
     sp: DiffDriveParameters
     trajectory: NDArray  # define the trajectory as a class parameter so we can set it in on_receive_global_plan and see it in get_commands
-    point: int #point indicates which point of the trajectory we are chasing
-    previous_state: #need to understand the type of this!!!!!!
+    point: int  # point indicates which point of the trajectory we are chasing
+
+    # previous_state: #need to understand the type of this!!!!!!
     def __init__(self):
         # feel free to remove/modify  the following
         self.params = Pdm4arAgentParams()
@@ -67,6 +68,12 @@ class Pdm4arAgent(Agent):
         # here i have to define global parameters to access than during the whole simulation
         # example
 
+        # save trajectory
+        self.trajectory = global_plan.trajectory
+
+        # set point counters
+        self.point = 0
+
     def get_commands(self, sim_obs: SimObservations) -> DiffDriveCommands:
         """This method is called by the simulator every dt_commands seconds (0.1s by default).
         Do not modify the signature of this method.
@@ -76,14 +83,18 @@ class Pdm4arAgent(Agent):
         :param sim_obs:
         :return:
         """
-        kp_linear = 2.0       
-        kp_angular = 4.0      
+        """if not hasattr(self, "trajectory") or self.trajectory is None:
+            # initial check if a trajectory exist
+            return DiffDriveCommands(omega_l=0, omega_r=0)
+        dt = 0.1  # input data
+        kp_linear = 2.0
+        kp_angular = 4.0
         kd_angular = 0.1
-        dist_tolerance = 0.05 
-        ang_tolerance = 0.05 
-        R = self.sg.wheelradius #radius of wheels 
-        L = self.sg.wheelbase #distance between wheels
-        #constant terms for the PD control
+        dist_tolerance = 0.05
+        ang_tolerance = 0.05
+        R = self.sg.wheelradius  # radius of wheels
+        L = self.sg.wheelbase  # distance between wheels
+        # constant terms for the PD control
         w_min, w_max = self.sp.omega_limits
         t = sim_obs.time
         current_state = sim_obs.players[self.name].state
@@ -92,41 +103,42 @@ class Pdm4arAgent(Agent):
         y = current_state.y
         psi = current_state.psi
         if t < 1e-8:
-            #initialize the previus state as current state at the initial timestep, we could initialize to zero but i don't know how to do it
+            # initialize the previus state as current state at the initial timestep, we could initialize to zero but i don't know how to do it
             self.previous_state = current_state
-            self.point = 0 #initial point is the first on the list
+            self.point = 0  # initial point is the first on the list
             return DiffDriveCommands(omega_l=0, omega_r=0)
         else:
-            dt = t - self.previous_time
             self.previous_time = t
 
-        #now i have to make the robot follow the trajectory 
-        if (self.point == len(self.trajectory)):
-            return DiffDriveCommands(omega_l=0, omega_r=0) #stop the robot if we arrived to the last point
-        
-        target = self.trajectory[self.point] #(x_target, y_target, psi_target)
+        # now i have to make the robot follow the trajectory
+        if self.point == len(self.trajectory):
+            return DiffDriveCommands(omega_l=0, omega_r=0)  # stop the robot if we arrived to the last point
+
+        target = self.trajectory[self.point]  # (x_target, y_target, psi_target)
         x_goal = target[0]
         y_goal = target[1]
         psi_goal = target[2]
 
         dx = x_goal - x
         dy = y_goal - y
-        distance = math.sqrt(dx**2 + dy**2) #distance from the target
-        heading_to_point = math.atan2(dy, dx) #check if i am heading to the point
-        normalize = lambda angle: math.atan2(math.sin(angle), math.cos(angle)) #clamp angles between [-pi, pi]
-        alpha = normalize(heading_to_point - psi) #normailzed error to check if i am heading to the goal --> this could be not relevant, it is if we d
-        beta = normalize(psi_goal - psi) #normailzed error to check if i am heading to the target angle
-        #implement a state machine to control 
+        distance = math.sqrt(dx**2 + dy**2)  # distance from the target
+        heading_to_point = math.atan2(dy, dx)  # check if i am heading to the point
+        normalize = lambda angle: math.atan2(math.sin(angle), math.cos(angle))  # clamp angles between [-pi, pi]
+        alpha = normalize(
+            heading_to_point - psi
+        )  # normailzed error to check if i am heading to the goal --> this could be not relevant, it is if we d
+        beta = normalize(psi_goal - psi)  # normailzed error to check if i am heading to the target angle
+        # implement a state machine to control
         # case 1 : heading error > 0 --> means have to head in the right direction
-        if distance > dist_tolerance: #if i am not in the point
-            if abs(alpha) > ang_tolerance: #it might be that i am not aligned to it
+        if distance > dist_tolerance:  # if i am not in the point
+            if abs(alpha) > ang_tolerance:  # it might be that i am not aligned to it
                 v_cmd = 0.0
-                relevant_angular_error = alpha # and so I have to first align to it
+                relevant_angular_error = alpha  # and so I have to first align to it
             else:
-                v_cmd = kp_linear * distance #or I might want to move on the straight line to get to the point
-                relevant_angular_error = alpha 
-        else: #i only need to get the right angular position
-            if abs(beta) > ang_tolerance: #in this case i need to rotate to reach the right angular position
+                v_cmd = kp_linear * distance  # or I might want to move on the straight line to get to the point
+                relevant_angular_error = alpha
+        else:  # i only need to get the right angular position
+            if abs(beta) > ang_tolerance:  # in this case i need to rotate to reach the right angular position
                 v_cmd = 0.0
                 relevant_angular_error = beta
             else:
@@ -134,9 +146,9 @@ class Pdm4arAgent(Agent):
                 self.point += 1
                 # If we have more points, this logic will pick up next step
                 # For this step, just stop to be safe
-                
-                
-        error_derivative = (relevant_angular_error - self.previous_state[2]) / dt if dt > 0 else 0. #(x, y, psi)
+
+        # !!!! ERROR HERE WE HAVE TO UNDERSTAND HOW TO ACCESS TO A STATE !!!
+        error_derivative = (relevant_angular_error - self.previous_state) / dt if dt > 0 else 0.0  # (x, y, psi)
         w_cmd = (kp_angular * relevant_angular_error) + (kd_angular * error_derivative)
         self.previous_state[2] = relevant_angular_error
 
@@ -145,7 +157,7 @@ class Pdm4arAgent(Agent):
         # Clamp the values in order to don't avoid the constarints
         if omega_r < w_min:
             omega_r = w_min
-        
+
         if omega_l < w_min:
             omega_l = w_min
 
@@ -153,9 +165,9 @@ class Pdm4arAgent(Agent):
             omega_r = w_max
 
         if omega_l > w_max:
-            omega_l = w_max
-        
-        return DiffDriveCommands(omega_l=omega_l, omega_r=omega_r)
+            omega_l = w_max"""  ######
+
+        return DiffDriveCommands(omega_l=0, omega_r=0)
 
 
 class Pdm4arGlobalPlanner(GlobalPlanner):
@@ -176,6 +188,27 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             fake_name="agent_1",
             trajectory=np.array([[1, 2, 3], [4, 5, 6]]),
         )
+
+        static_obstacles = []
+        grid = []
+        for obs in init_sim_obs.dg_scenario.static_obstacles:
+
+            if isinstance(obs, StaticObstacle):
+                geom = obs.shape
+            elif isinstance(obs, BaseGeometry):
+                geom = obs
+            elif hasattr(obs, "polygon"):
+                geom = obs.polygon
+            else:
+                continue
+
+            if geom.geom_type in ("LinearRing"):
+                grid.append(obs)
+
+            static_obstacles.append(geom)
+
+        print(grid)
+
         # but keep in mind that this could be a bottle neck for high number of robots/goals
         # frist sample points, create grid
         #
@@ -189,7 +222,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         #
         # pass the environmental information
         #
-        #note for control pupose you should return a trajectory of size (N_points, 3), for each waypoint in the trajectory we should have (x, y, psi)
-        #plis stick to the convention (x, y, psi) in a numpy array where the first element is x, the second y, and the 3rd is psi
+        # note for control pupose you should return a trajectory of size (N_points, 3), for each waypoint in the trajectory we should have (x, y, psi)
+        # plis stick to the convention (x, y, psi) in a numpy array where the first element is x, the second y, and the 3rd is psi
 
         return global_plan_message.model_dump_json(round_trip=True)
