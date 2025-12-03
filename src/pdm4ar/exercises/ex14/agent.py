@@ -79,6 +79,12 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
     def send_plan(self, init_sim_obs: InitSimGlobalObservations) -> str:
         # TODO: implement here your global planning stack.
+        # create probabilistic roadmap
+        # first define points
+        # connect the k nearest points
+        # check for intersections with obstacles
+        # use A* to get shortest path
+        # results in roadmap with shortest path for every goal to dropoff and every robot
         global_plan_message = GlobalPlanMessage(
             fake_id=1,
             fake_name="agent_1",
