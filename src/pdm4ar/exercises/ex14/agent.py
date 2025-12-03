@@ -2,8 +2,12 @@ from decimal import Decimal
 import random
 from dataclasses import dataclass
 from turtle import position
-from typing import Mapping, Sequence
+from typing import Mapping, Sequence, List
 import math
+from math import inf
+from shapely.geometry.base import BaseGeometry
+from shapely.geometry import Point as ShPoint
+import heapq
 import dg_commons
 import numpy as np
 from dg_commons import PlayerName
@@ -43,9 +47,11 @@ class Pdm4arAgent(Agent):
     point: int  # point indicates which point of the trajectory we are chasing
 
     # previous_state: #need to understand the type of this!!!!!!
-    def __init__(self):
+    def __init__(self, res: float = 0.5, robot_radius: float = 0.3):
         # feel free to remove/modify  the following
         self.params = Pdm4arAgentParams()
+        self.res = res
+        self.robot_radius = robot_radius
 
     def on_episode_init(self, init_sim_obs: InitSimObservations):
         # called at the beginning of the simulation
@@ -177,22 +183,25 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
     Feel free to add additional methods, objects and functions that help you to solve the task
     """
 
-    def __init__(self):
-        pass
+    def __init__(self, res: float = 0.5, robot_radius: float = 0.3):
+        self.res = res
+        self.robot_radius = robot_radius
+        self.grid = None
+        self.x_min = None
+        self.y_min = None
 
-    def send_plan(self, init_sim_obs: InitSimGlobalObservations) -> str:
-        # TODO: implement here your global planning stack.
-        # create a grid representing the world.
-        global_plan_message = GlobalPlanMessage(
-            fake_id=1,
-            fake_name="agent_1",
-            trajectory=np.array([[1, 2, 3], [4, 5, 6]]),
-        )
+    # function that builds the occupancy grid
+    def get_occupancy_grid(self, init_sim_obs: InitSimGlobalObservations):
+        # return: occupancy grid, and origin of the grid in world coords
+        dg = init_sim_obs.dg_scenario
+        r = self.robot_radius
+        res = self.res
 
-        static_obstacles = []
-        grid = []
-        for obs in init_sim_obs.dg_scenario.static_obstacles:
+        boundary_geom: BaseGeometry | None = None
+        shapely_geoms: List[BaseGeometry] = []
 
+        # extract boundaries
+        for obs in dg.static_obstacles:
             if isinstance(obs, StaticObstacle):
                 geom = obs.shape
             elif isinstance(obs, BaseGeometry):
@@ -202,12 +211,256 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             else:
                 continue
 
-            if geom.geom_type in ("LinearRing"):
-                grid.append(obs)
+            if geom.geom_type == "LinearRing":
+                # boundaries found
+                boundary_geom = geom
+                continue
 
-            static_obstacles.append(geom)
+            # buffer obstacles
+            shapely_geoms.append(geom.buffer(r))
 
-        print(grid)
+        minx, miny, maxx, maxy = boundary_geom.bounds
+
+        # shrink the map for robot radius
+        x_min = minx + r
+        y_min = miny + r
+        x_max = maxx - r
+        y_max = maxy - r
+
+        # number of cells of the grid
+        nx = int(np.ceil((x_max - x_min) / res))
+        ny = int(np.ceil((y_max - y_min) / res))
+
+        grid = np.zeros((ny, nx), dtype=bool)
+
+        # set to false occupied cells
+        for geom in shapely_geoms:
+            gminx, gminy, gmaxx, gmaxy = geom.bounds
+
+            cell_min_x = max(0, int((gminx - x_min) / res))
+            cell_max_x = min(nx - 1, int((gmaxx - x_min) / res))
+            cell_min_y = max(0, int((gminy - y_min) / res))
+            cell_max_y = min(ny - 1, int((gmaxy - y_min) / res))
+
+            if cell_min_x > cell_max_x or cell_min_y > cell_max_y:
+                continue
+
+            xs = x_min + (np.arange(cell_min_x, cell_max_x + 1) + 0.5) * res
+            ys = y_min + (np.arange(cell_min_y, cell_max_y + 1) + 0.5) * res
+            X, Y = np.meshgrid(xs, ys)
+
+            pts = [ShPoint(x, y) for x, y in zip(X.ravel(), Y.ravel())]
+            mask = np.array([geom.covers(p) for p in pts], dtype=bool).reshape(len(ys), len(xs))
+
+            grid[cell_min_y : cell_max_y + 1, cell_min_x : cell_max_x + 1] |= mask
+
+        self.grid = grid
+        self.x_min = x_min
+        self.y_min = y_min
+
+    # helper function for trajectory smoothing, description inside
+    def bresenham_cells(self, i0, j0, i1, j1):
+        # function that, given two cells in the grid, returns all the cells encountered ...
+        # if connecting the two cells with a straight line
+        cells = []
+        di = abs(i1 - i0)
+        dj = abs(j1 - j0)
+        si = 1 if i1 > i0 else -1
+        sj = 1 if j1 > j0 else -1
+        i, j = i0, j0
+        if dj <= di:
+            err = 2 * dj - di
+            for _ in range(di + 1):
+                cells.append((i, j))
+                if err > 0:
+                    j += sj
+                    err -= 2 * di
+                i += si
+                err += 2 * dj
+        else:
+            err = 2 * di - dj
+            for _ in range(dj + 1):
+                cells.append((i, j))
+                if err > 0:
+                    i += si
+                    err -= 2 * dj
+                j += sj
+                err += 2 * di
+        return cells
+
+    # helper function for trajectory smoothing, description inside
+    def line_of_sight(self, a, b):
+        # function that returns TRUE if all cells crossed if connecting two cells with ...
+        # a straight line (bresenham) are free
+        i0, j0 = a
+        i1, j1 = b
+        grid = self.grid
+        for i, j in self.bresenham_cells(i0, j0, i1, j1):
+            if grid[i, j]:
+                return False
+        return True
+
+    # function that actually performs trajectory smoothing
+    # (already called inside astar, no need to actively use it)
+    def smooth_path(self, path):
+        # function that actually perfomrs line smoothing
+        if path is None:
+            return None
+        if len(path) <= 2:
+            return path
+        n = len(path)
+        new = [path[0]]
+        i = 0
+        while i < n - 1:
+            j = n - 1
+            # find farthest point reachable
+            while j > i + 1 and not self.line_of_sight(path[i], path[j]):
+                j -= 1
+            new.append(path[j])
+            i = j
+        return new
+
+    # function that finds the best path from start to goal,
+    # and then smooths it to improve it
+    def astar(self, start, goal):
+        # return the optimal path from start to goal. grid must be an occupancy grid
+        # Also performs trajecotry smoothing inside
+        grid = self.grid
+        ny, nx = grid.shape
+        si, sj = start
+        gi, gj = goal
+
+        if not (0 <= si < ny and 0 <= sj < nx):
+            return None
+        if not (0 <= gi < ny and 0 <= gj < nx):
+            return None
+        if grid[si, sj] or grid[gi, gj]:
+            return None
+
+        def heuristic(i, j):
+            return ((i - gi) ** 2 + (j - gj) ** 2) ** 0.5
+
+        # neighbor directions
+        dirs4 = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        dirs_diag = [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+
+        def neighbors(i, j):
+            for di, dj in dirs4:
+                ni = i + di
+                nj = j + dj
+                if 0 <= ni < ny and 0 <= nj < nx and not grid[ni, nj]:
+                    yield ni, nj, 1.0
+            for di, dj in dirs_diag:
+                ni = i + di
+                nj = j + dj
+                if not (0 <= ni < ny and 0 <= nj < nx):
+                    continue
+                if grid[ni, nj]:
+                    continue
+                # prevent squeezing through corners
+                if grid[i + di, j] or grid[i, j + dj]:
+                    continue
+                yield ni, nj, 2**0.5
+
+        g_cost = np.full((ny, nx), np.inf, dtype=float)
+        g_cost[si, sj] = 0.0
+
+        parent = {}
+        parent[(si, sj)] = None
+
+        open_heap = []
+        heapq.heappush(open_heap, (heuristic(si, sj), (si, sj)))
+
+        in_open = np.zeros((ny, nx), dtype=bool)
+        in_open[si, sj] = True
+
+        while open_heap:
+            f, (i, j) = heapq.heappop(open_heap)
+            in_open[i, j] = False
+
+            if (i, j) == (gi, gj):
+                path = []
+                cur = (i, j)
+                while cur is not None:
+                    path.append(cur)
+                    cur = parent[cur]
+                path.reverse()
+                # smooth trajectory
+                return self.smooth_path(path)
+
+            for ni, nj, c_step in neighbors(i, j):
+                tentative_g = g_cost[i, j] + c_step
+                if tentative_g < g_cost[ni, nj]:
+                    g_cost[ni, nj] = tentative_g
+                    parent[(ni, nj)] = (i, j)
+                    f_new = tentative_g + heuristic(ni, nj)
+                    if not in_open[ni, nj]:
+                        heapq.heappush(open_heap, (f_new, (ni, nj)))
+                        in_open[ni, nj] = True
+
+        return None
+
+    # helper to transforms world points into grid points
+    def world_to_grid(self, x, y):
+        grid = self.grid
+        res = self.res
+        x_min = self.x_min
+        y_min = self.y_min
+        ny, nx = grid.shape
+        j = int((x - x_min) / res)
+        i = int((y - y_min) / res)
+        if 0 <= i < ny and 0 <= j < nx:
+            return i, j
+        return None
+
+    # helper to transforms grid points into world points
+    def grid_to_world(self, i, j):
+        res = self.res
+        x_min = self.x_min
+        y_min = self.y_min
+        x = x_min + (j + 0.5) * res
+        y = y_min + (i + 0.5) * res
+        return x, y
+
+    # transforms the path, as a list of gird cells,
+    # into an array of [x,y,psi] trajectory waypoints
+    def cells_to_waypoints(self, path_cells):
+        res = self.res
+        x_min = self.x_min
+        y_min = self.y_min
+        if path_cells is None or len(path_cells) == 0:
+            return np.zeros((0, 3), dtype=float)
+        n = len(path_cells)
+        xy = np.zeros((n, 2), dtype=float)
+        for k, (i, j) in enumerate(path_cells):
+            x, y = self.grid_to_world(i, j)
+            xy[k, 0] = x
+            xy[k, 1] = y
+
+        psi = np.zeros(n, dtype=float)
+        if n == 1:
+            psi[0] = 0.0
+        else:
+            for k in range(n - 1):
+                dx = xy[k + 1, 0] - xy[k, 0]
+                dy = xy[k + 1, 1] - xy[k, 1]
+                psi[k] = math.atan2(dy, dx)
+            psi[-1] = psi[-2]
+
+        traj = np.zeros((n, 3), dtype=float)
+        traj[:, 0] = xy[:, 0]
+        traj[:, 1] = xy[:, 1]
+        traj[:, 2] = psi
+        return traj
+
+    def send_plan(self, init_sim_obs: InitSimGlobalObservations) -> str:
+        # TODO: implement here your global planning stack.
+        # create a grid representing the world.
+        global_plan_message = GlobalPlanMessage(
+            fake_id=1,
+            fake_name="agent_1",
+            trajectory=np.array([[1, 2, 3], [4, 5, 6]]),
+        )
 
         # but keep in mind that this could be a bottle neck for high number of robots/goals
         # frist sample points, create grid
