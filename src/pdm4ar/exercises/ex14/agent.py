@@ -464,18 +464,13 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         total= 0.0
 
         for (i1, j1), (i2, j2) in zip(path[:-1], path[1:]):
-            di = abs(i2 - i1)
-            dj = abs(j2 - j1)
-
-            if di == 1 and dj == 1:
-                total += math.sqrt(2)
-            else:
-                total += 1.0
+            x1, y1 = self.grid_to_world(i1, j1)
+            x2, y2 = self.grid_to_world(i2, j2)
+            total += math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
         return total
 
     def send_plan(self, init_sim_obs: InitSimGlobalObservations) -> str:
-        # TO DO: implement here your global planning stack.
-        # create a grid representing the world.
+        ### STEP 1: create a grid representing the world.
         self.get_occupancy_grid(init_sim_obs)
 
         # extract robots, goals and dropoff points
@@ -527,7 +522,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         else:
             print("ERROR: No dropoff points found")
 
-        # precompute goal to nearest drop off
+        ### STEP 2: precompute goal to nearest drop off
         goal_drop_cost = {}
         goal_drop_path = {}
 
@@ -549,13 +544,17 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 goal_drop_cost[gid] = float("inf")
                 goal_drop_path[gid] = None
         
-        # build cost matrix for robots to goals
+        # STEP 3: assign to each robot one goal
+        # first compute the distances for every robot to each goal, 
+        # to do this a cost matrix for robots to goals is built, 
+        # this cost matrix is later used for a linear sum optimizer
         robots_sorted = sorted(robot_grid.keys())
         goals_sorted = sorted(goal_grid.keys())
         num_r = len(robots_sorted)
         num_g = len(goals_sorted)
 
         cost_matrix = np.full((num_r, num_g), np.inf)
+        # paths from robot to goal
         paths_rg = {}
 
         for i, r in enumerate(robots_sorted):
@@ -570,6 +569,11 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
                 cost_matrix[i, j] = self.path_cost(path_rg) + goal_drop_cost[g]
                 paths_rg[(r, g)] = path_rg
+
+        if True:
+            print("Robots:", robots_sorted)
+            print("Goals:", goals_sorted)
+            print("Cost matrix:\n", cost_matrix)
 
         # use optimizer for first assignment
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
@@ -603,7 +607,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             robot_finish_time[r] = cost_matrix[i, j]
             assignments[r].append(g)
 
-        # remaining goals
+        ### STEP 4: assign the remaining goals to robots
         remaining_goals = [g for g in goals_sorted if g not in assigned_goals]
 
         while remaining_goals:
@@ -651,7 +655,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             # update robot finish time
             robot_finish_time[r] += best_cost
         
-        # convert grid paths to world trajectories
+        ### STEP 5: convert grid paths to world trajectories
         trajectories = {}
         for r in robots_sorted:
             cells = robot_paths[r]
@@ -662,10 +666,13 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             trajectories = trajectories
         )
 
+
+
+        ### plot the trajectories
         DEBUG = True
         if DEBUG:
             import matplotlib.pyplot as plt
-    
+
             print("\nDEBUG: Generating debug_map.png\n")
 
             plt.figure(figsize=(10, 10))
