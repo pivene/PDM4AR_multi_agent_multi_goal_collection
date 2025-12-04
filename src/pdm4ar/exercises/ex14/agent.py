@@ -46,7 +46,7 @@ class Pdm4arAgent(Agent):
     point: int  # point indicates which point of the trajectory we are chasing
 
     # previous_state: #need to understand the type of this!!!!!!
-    def __init__(self, res: float = 0.5, robot_radius: float = 0.3):
+    def __init__(self, res: float = 0.1, robot_radius: float = 0.6):
         # feel free to remove/modify  the following
         self.params = Pdm4arAgentParams()
         self.res = res
@@ -184,7 +184,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
     Feel free to add additional methods, objects and functions that help you to solve the task
     """
 
-    def __init__(self, res: float = 0.3, robot_radius: float = 0.3):
+    def __init__(self, res: float = 0.1, robot_radius: float = 0.6):
         self.res = res
         self.robot_radius = robot_radius
         self.grid = None
@@ -218,7 +218,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 continue
 
             # buffer obstacles
-            shapely_geoms.append(geom.buffer(r+0.4))
+            shapely_geoms.append(geom.buffer(r + 0.1))
 
         minx, miny, maxx, maxy = boundary_geom.bounds
 
@@ -453,24 +453,23 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         traj[:, 1] = xy[:, 1]
         traj[:, 2] = psi
         return traj
-    
+
     def path_cost(self, path):
         """
-        Compute geometric cost of a path in grid cells, for a straight step = 1 for a diagonal step = sqrt(2)
+        Compute geometric cost of a path in grid cells as the
+        true Euclidean length in world coordinates.
         """
         if path is None or len(path) < 2:
             return 0.0
-        
-        total= 0.0
+
+        total = 0.0
+        res = self.res
 
         for (i1, j1), (i2, j2) in zip(path[:-1], path[1:]):
-            di = abs(i2 - i1)
-            dj = abs(j2 - j1)
+            di = i2 - i1
+            dj = j2 - j1
+            total += math.hypot(di * res, dj * res)
 
-            if di == 1 and dj == 1:
-                total += math.sqrt(2)
-            else:
-                total += 1.0
         return total
 
     def send_plan(self, init_sim_obs: InitSimGlobalObservations) -> str:
@@ -524,8 +523,6 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 g = self.world_to_grid(xd, yd)
                 if g is not None:
                     drop_grid.append(g)
-        else:
-            print("ERROR: No dropoff points found")
 
         # precompute goal to nearest drop off
         goal_drop_cost = {}
@@ -548,7 +545,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             if best_path is None:
                 goal_drop_cost[gid] = float("inf")
                 goal_drop_path[gid] = None
-        
+
         # build cost matrix for robots to goals
         robots_sorted = sorted(robot_grid.keys())
         goals_sorted = sorted(goal_grid.keys())
@@ -568,7 +565,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 if goal_drop_path[g] is None:
                     continue
 
-                cost_matrix[i, j] = self.path_cost(path_rg) + goal_drop_cost[g]
+                cost_matrix[i, j] = self.path_cost(path_rg)  # + goal_drop_cost[g]
                 paths_rg[(r, g)] = path_rg
 
         # use optimizer for first assignment
@@ -622,18 +619,18 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
                 path_rg = self.astar(robot_current_pos[r], goal_grid[g])
                 if path_rg is None:
-                     continue
-                
+                    continue
+
                 total_cost = self.path_cost(path_rg) + goal_drop_cost[g]
                 if total_cost < best_cost:
                     best_cost = total_cost
                     best_g = g
                     best_path_rg = path_rg
-                
+
             if best_g is None:
                 # if robot cannot reach any remaining goal
                 break
-            
+
             # assign this goal
             assignments[r].append(best_g)
             remaining_goals.remove(best_g)
@@ -650,22 +647,93 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
             # update robot finish time
             robot_finish_time[r] += best_cost
-        
+
+        # we have to avoid robots stopping at the drop off locations.
+        # Once they finish their path, we must send them somewhere else.
+        parking_radius = 3.0
+        max_trials = 100
+        radius_cells = max(1, int(parking_radius / self.res))
+        ny, nx = self.grid.shape
+        robot_rad = self.robot_radius
+        drop_radius = 1.0
+        min_drop_dist = drop_radius + robot_rad
+        # sort robot in order of finish time
+        robots_by_finish = sorted(robot_finish_time.items(), key=lambda kv: kv[1])
+        for r, _ in robots_by_finish:
+            if r not in robot_current_pos:
+                continue
+            si, sj = robot_current_pos[r]
+            # final dropoff center for this robot
+            x_d, y_d = self.grid_to_world(si, sj)
+
+            best_segment = None
+            for _ in range(max_trials):
+                di = random.randint(-radius_cells, radius_cells)
+                dj = random.randint(-radius_cells, radius_cells)
+                ni = si + di
+                nj = sj + dj
+                if not (0 <= ni < ny and 0 <= nj < nx):
+                    continue
+                if self.grid[ni, nj]:
+                    continue
+                if (ni, nj) == (si, sj):
+                    continue
+
+                x_c, y_c = self.grid_to_world(ni, nj)
+                if math.hypot(x_c - x_d, y_c - y_d) < min_drop_dist:
+                    continue
+
+                segment = self.astar((si, sj), (ni, nj))
+                if segment is None:
+                    continue
+                best_segment = segment
+                break
+
+            if best_segment is None:
+                continue
+
+            robot_paths[r].extend(best_segment[1:])
+            fi, fj = best_segment[-1]
+            robot_current_pos[r] = (fi, fj)
+
+            # mark all cells within robot radius around parking cell as occupied
+            x_p, y_p = self.grid_to_world(fi, fj)
+            disc = ShPoint(x_p, y_p).buffer(robot_rad)  # circular footprint in world coords
+
+            gminx, gminy, gmaxx, gmaxy = disc.bounds
+            x_min = self.x_min
+            y_min = self.y_min
+            res = self.res
+            ny, nx = self.grid.shape
+
+            cell_min_x = max(0, int((gminx - x_min) / res))
+            cell_max_x = min(nx - 1, int((gmaxx - x_min) / res))
+            cell_min_y = max(0, int((gminy - y_min) / res))
+            cell_max_y = min(ny - 1, int((gmaxy - y_min) / res))
+
+            if cell_min_x <= cell_max_x and cell_min_y <= cell_max_y:
+                xs = x_min + (np.arange(cell_min_x, cell_max_x + 1) + 0.5) * res
+                ys = y_min + (np.arange(cell_min_y, cell_max_y + 1) + 0.5) * res
+                X, Y = np.meshgrid(xs, ys)
+
+                pts = [ShPoint(x, y) for x, y in zip(X.ravel(), Y.ravel())]
+                mask = np.array([disc.covers(p) for p in pts], dtype=bool).reshape(len(ys), len(xs))
+
+                self.grid[cell_min_y : cell_max_y + 1, cell_min_x : cell_max_x + 1] |= mask
+
         # convert grid paths to world trajectories
         trajectories = {}
         for r in robots_sorted:
             cells = robot_paths[r]
             trajectories[r] = self.cells_to_waypoints(cells)
-        
-        # build global plan message
-        global_plan_message = GlobalPlanMessage(
-            trajectories = trajectories
-        )
 
-        DEBUG = True
+        # build global plan message
+        global_plan_message = GlobalPlanMessage(trajectories=trajectories)
+
+        DEBUG = False
         if DEBUG:
             import matplotlib.pyplot as plt
-    
+
             print("\nDEBUG: Generating debug_map.png\n")
 
             plt.figure(figsize=(10, 10))
@@ -699,8 +767,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
                     plt.fill(x, y, color="gold", alpha=0.9, edgecolor="black")
                     cx, cy = poly.centroid.x, poly.centroid.y
-                    plt.text(cx, cy, f"G{gid}", color="black",
-                            ha="center", va="center", fontsize=10)
+                    plt.text(cx, cy, f"G{gid}", color="black", ha="center", va="center", fontsize=10)
 
             # 3) Dropoff points (green)
             if drops is not None:
@@ -715,14 +782,12 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
                     plt.fill(x, y, color="lightgreen", alpha=0.9, edgecolor="black")
                     cx, cy = poly.centroid.x, poly.centroid.y
-                    plt.text(cx, cy, f"D{cp_id}", color="black",
-                            ha="center", va="center", fontsize=10)
+                    plt.text(cx, cy, f"D{cp_id}", color="black", ha="center", va="center", fontsize=10)
 
             # 4) Robot starting positions (blue)
             for name, state in robots_states.items():
                 plt.plot(state.x, state.y, "bo", markersize=8)
-                plt.text(state.x, state.y, name, color="blue",
-                        ha="left", va="bottom", fontsize=10)
+                plt.text(state.x, state.y, name, color="blue", ha="left", va="bottom", fontsize=10)
 
             # 5) Trajectories (red)
             for name, traj in trajectories.items():
@@ -743,7 +808,6 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             plt.close()
 
             print("Saved debug map to debug_map.png\n")
-
 
         # but keep in mind that this could be a bottle neck for high number of robots/goals
         # frist sample points, create grid
