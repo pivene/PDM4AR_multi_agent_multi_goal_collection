@@ -57,6 +57,7 @@ class Pdm4arAgent(Agent):
         self.sg = init_sim_obs.model_geometry
         self.sp = init_sim_obs.model_params
         self.name = init_sim_obs.my_name
+        self.prev_ang_err = 0.0
 
         pass
 
@@ -147,13 +148,14 @@ class Pdm4arAgent(Agent):
             else:
                 # Waypoint Reached! Move to next point
                 self.point += 1
+                return DiffDriveCommands(omega_l=0, omega_r=0)
                 # If we have more points, this logic will pick up next step
                 # For this step, just stop to be safe
 
         # !!!! ERROR HERE WE HAVE TO UNDERSTAND HOW TO ACCESS TO A STATE !!!
-        error_derivative = (relevant_angular_error - self.previous_state) / dt if dt > 0 else 0.0  # (x, y, psi)
+        error_derivative = (relevant_angular_error - self.prev_ang_err) / dt if dt > 0 else 0.0  # (x, y, psi)
+        self.prev_ang_err = relevant_angular_error
         w_cmd = (kp_angular * relevant_angular_error) + (kd_angular * error_derivative)
-        self.previous_state[2] = relevant_angular_error
 
         omega_r = (v_cmd + (w_cmd * L / 2)) / R
         omega_l = (v_cmd - (w_cmd * L / 2)) / R
@@ -475,8 +477,9 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         self.get_occupancy_grid(init_sim_obs)
 
         # extract robots, goals and dropoff points
-        robots = init_sim_obs.players
-        goals = init_sim_obs.goals
+        robots = init_sim_obs.players_obs
+        robots_states = init_sim_obs.initial_states
+        goals = init_sim_obs.shared_goals
         drops = init_sim_obs.collection_points
 
         # helper function to get centre of a shapely polygon
@@ -488,9 +491,10 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         # convert robots to the grid
         # so map each robots nae to its grid cell location
         robot_grid = {}
-        for name, obs in robots.items():
-            xr = obs.state.x
-            yr = obs.state.y
+        for name in robots.keys():
+            state = robots_states[name]
+            xr = float(state.x)
+            yr = float(state.y)
             g = self.world_to_grid(xr, yr)
             if g is None:
                 # robots is out of bounds
@@ -500,25 +504,26 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         # convert goals to grid
         # so map each goals ID to its grid cell location
         goal_grid = {}
-        for gid, gobj in goals.items():
-            xg, yg = centre_of_poly(gobj.occupancy)
-            g = self.world_to_grid(xg, yg)
-            if g is None:
-                # goals is out of bounds
-                continue
-            goal_grid[gid] = g
+        if goals is not None:
+            for gid, gobj in goals.items():
+                xg, yg = centre_of_poly(gobj.polygon)
+                g = self.world_to_grid(xg, yg)
+                if g is None:
+                    # goals is out of bounds
+                    continue
+                goal_grid[gid] = g
 
         # convert dropoff to grid
         # so map each dropoff ID to its grid cell location
         drop_grid = []
-        for cp in drops:
-            xd, yd = centre_of_poly(cp.occupancy)
-            g = self.world_to_grid(xd, yd)
-            if g is not None:
-                drop_grid.append(g)
-        if len(drop_grid) == 0:
+        if drops is not None:
+            for cp_id, cp in drops.items():
+                xd, yd = centre_of_poly(cp.polygon)
+                g = self.world_to_grid(xd, yd)
+                if g is not None:
+                    drop_grid.append(g)
+        else:
             print("ERROR: No dropoff points found")
-            return GlobalPlanMessage(trajectories={}).model_dump_json(round_trip=True)
 
         # precompute goal to nearest drop off
         goal_drop_cost = {}
