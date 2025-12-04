@@ -1,6 +1,7 @@
 from decimal import Decimal
 import random
 from dataclasses import dataclass
+from re import A
 from turtle import position
 from typing import Mapping, Sequence, List, Dict
 import math
@@ -19,6 +20,7 @@ from dg_commons.sim.models.diff_drive_structures import DiffDriveGeometry, DiffD
 from dg_commons.sim.models.obstacles import StaticObstacle
 from numpydantic import NDArray
 from pydantic import BaseModel
+from scipy.optimize import linear_sum_assignment
 
 
 class GlobalPlanMessage(BaseModel):
@@ -172,7 +174,7 @@ class Pdm4arAgent(Agent):
         if omega_l > w_max:
             omega_l = w_max
 
-        return DiffDriveCommands(omega_l=0, omega_r=0)
+        return DiffDriveCommands(omega_l=omega_l, omega_r=omega_r)
 
 
 class Pdm4arGlobalPlanner(GlobalPlanner):
@@ -182,7 +184,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
     Feel free to add additional methods, objects and functions that help you to solve the task
     """
 
-    def __init__(self, res: float = 0.5, robot_radius: float = 0.3):
+    def __init__(self, res: float = 0.3, robot_radius: float = 0.3):
         self.res = res
         self.robot_radius = robot_radius
         self.grid = None
@@ -216,7 +218,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 continue
 
             # buffer obstacles
-            shapely_geoms.append(geom.buffer(r))
+            shapely_geoms.append(geom.buffer(r+0.4))
 
         minx, miny, maxx, maxy = boundary_geom.bounds
 
@@ -489,9 +491,9 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             return float(c.x), float(c.y)
 
         # convert robots to the grid
-        # so map each robots nae to its grid cell location
+        # so map each robots name to its grid cell location
         robot_grid = {}
-        for name in robots.keys():
+        for name in sorted(robots.keys()):
             state = robots_states[name]
             xr = float(state.x)
             yr = float(state.y)
@@ -505,7 +507,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         # so map each goals ID to its grid cell location
         goal_grid = {}
         if goals is not None:
-            for gid, gobj in goals.items():
+            for gid, gobj in sorted(goals.items()):
                 xg, yg = centre_of_poly(gobj.polygon)
                 g = self.world_to_grid(xg, yg)
                 if g is None:
@@ -517,7 +519,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         # so map each dropoff ID to its grid cell location
         drop_grid = []
         if drops is not None:
-            for cp_id, cp in drops.items():
+            for cp_id, cp in sorted(drops.items()):
                 xd, yd = centre_of_poly(cp.polygon)
                 g = self.world_to_grid(xd, yd)
                 if g is not None:
@@ -546,136 +548,202 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             if best_path is None:
                 goal_drop_cost[gid] = float("inf")
                 goal_drop_path[gid] = None
+        
+        # build cost matrix for robots to goals
+        robots_sorted = sorted(robot_grid.keys())
+        goals_sorted = sorted(goal_grid.keys())
+        num_r = len(robots_sorted)
+        num_g = len(goals_sorted)
 
-        ### INITIALIZE ASSIGNMENTS
-        remaining_goals = set(goal_grid.keys())
+        cost_matrix = np.full((num_r, num_g), np.inf)
+        paths_rg = {}
 
-        # each robots current location on grid
-        robot_current_pos = {r: robot_grid[r] for r in robot_grid}
+        for i, r in enumerate(robots_sorted):
+            for j, g in enumerate(goals_sorted):
+                # robot to goal
+                path_rg = self.astar(robot_grid[r], goal_grid[g])
+                if path_rg is None:
+                    continue
+                # total cost robot to goal + goal to dropoff
+                if goal_drop_path[g] is None:
+                    continue
 
-        # accumulated path length assigned to each robot
-        robot_finish_time = {r: 0.0 for r in robot_grid}
+                cost_matrix[i, j] = self.path_cost(path_rg) + goal_drop_cost[g]
+                paths_rg[(r, g)] = path_rg
 
-        # list of goal IDs in order for each robot
-        assignments = {r: [] for r in robot_grid}
+        # use optimizer for first assignment
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
-        # final path for each robot
-        robot_paths = {r: [] for r in robot_grid}
+        # initialize assignment structures
+        assignments = {r: [] for r in robots_sorted}
+        robot_paths = {r: [] for r in robots_sorted}
+        robot_current_pos = {}
+        robot_finish_time = {}
+        assigned_goals = set()
 
-        ### PHASE 1: assign one goal per robot
-        for r in robot_grid:
-            best_gid = None
+        for i, j in zip(row_ind, col_ind):
+            r = robots_sorted[i]
+            g = goals_sorted[j]
+
+            if not np.isfinite(cost_matrix[i, j]):
+                continue
+
+            assigned_goals.add(g)
+
+            # robot to goal
+            path_rg = paths_rg[(r, g)]
+            robot_paths[r].extend(path_rg)
+
+            # goal to dropoff
+            g2d = goal_drop_path[g]
+            robot_paths[r].extend(g2d[1:])
+
+            # update robot
+            robot_current_pos[r] = g2d[-1]
+            robot_finish_time[r] = cost_matrix[i, j]
+            assignments[r].append(g)
+
+        # remaining goals
+        remaining_goals = [g for g in goals_sorted if g not in assigned_goals]
+
+        while remaining_goals:
+            # pick the robot that becomes available first
+            r = min(robot_finish_time, key=lambda x: robot_finish_time[x])
+
+            # find best goal for this robot
+            best_g = None
             best_cost = float("inf")
             best_path_rg = None
 
-            for gid in remaining_goals:
-                # robot start to goal
-                path_rg = self.astar(robot_current_pos[r], goal_grid[gid])
-                if path_rg is None:
-                    continue
-                cost_rg = self.path_cost(path_rg)
-
-                # cost from goal to drop
-                cost_gd = goal_drop_cost[gid]
-                total = cost_rg + cost_gd
-                if goal_drop_path[gid] is None:
-                    continue
-
-                if total < best_cost:
-                    best_cost = total
-                    best_gid = gid
-                    best_path_rg = path_rg
-
-            if best_gid is None:
-                # if robot cannot reach any remaining goal
-                continue
-            
-            # assign this goal
-            assignments[r].append(best_gid)
-            remaining_goals.remove(best_gid)
-
-            # append robot to goal path
-            robot_paths[r].extend(best_path_rg)
-
-            # append goal to dropoff path
-            g2d = goal_drop_path[best_gid]
-            robot_paths[r].extend(g2d[1:])
-
-            # update robot current position, which is dropoff location
-            robot_current_pos[r] = g2d[-1]
-
-            # update robot finish time
-            robot_finish_time[r] += best_cost
-
-        ### PHASE 2: if more goals remain, assign to robot with minimal finish time
-        while len(remaining_goals) > 0:
-            # pick the robot that becomes available first
-            best_robot = None
-            best_time = float("inf")
-
-            for robot, finish_time in robot_finish_time.items():
-                if finish_time < best_time:
-                    best_time = finish_time
-                    best_robot = robot
-            if best_robot is None:
-                break
-            r = best_robot
-
-            # find best goal for this robot
-            best_gid = None
-            best_increase = float("inf")
-            best_path_rg = None
-
-            for gid in list(remaining_goals):
+            for g in remaining_goals:
                 # skip unreachable goals
-                if goal_drop_path[gid] is None:
+                if goal_drop_path[g] is None:
                     continue
 
-                path_rg = self.astar(robot_current_pos[r], goal_grid[gid])
+                path_rg = self.astar(robot_current_pos[r], goal_grid[g])
                 if path_rg is None:
                      continue
-                cost_rg = self.path_cost(path_rg)
-
-                # cost from goal to dropoff
-                cost_gd = goal_drop_cost[gid]
-                increase = cost_rg + cost_gd
-
-                if increase < best_increase:
-                    best_increase = increase
-                    best_gid = gid
+                
+                total_cost = self.path_cost(path_rg) + goal_drop_cost[g]
+                if total_cost < best_cost:
+                    best_cost = total_cost
+                    best_g = g
                     best_path_rg = path_rg
                 
-            if best_gid is None:
+            if best_g is None:
                 # if robot cannot reach any remaining goal
                 break
             
             # assign this goal
-            assignments[r].append(best_gid)
-            remaining_goals.remove(best_gid)
+            assignments[r].append(best_g)
+            remaining_goals.remove(best_g)
 
             # append robot to goal path
             robot_paths[r].extend(best_path_rg[1:])
 
             # append goal to dropoff path
-            g2d = goal_drop_path[best_gid]
+            g2d = goal_drop_path[best_g]
             robot_paths[r].extend(g2d[1:])
 
             # update robot current position
             robot_current_pos[r] = g2d[-1]
 
             # update robot finish time
-            robot_finish_time[r] += best_increase
+            robot_finish_time[r] += best_cost
         
         # convert grid paths to world trajectories
         trajectories = {}
-        for r, cells in robot_paths.items():
-            traj = self.cells_to_waypoints(cells)
-            trajectories[r] = traj
+        for r in robots_sorted:
+            cells = robot_paths[r]
+            trajectories[r] = self.cells_to_waypoints(cells)
         
         # build global plan message
         global_plan_message = GlobalPlanMessage(
             trajectories = trajectories
         )
+
+        DEBUG = True
+        if DEBUG:
+            import matplotlib.pyplot as plt
+    
+            print("\nDEBUG: Generating debug_map.png\n")
+
+            plt.figure(figsize=(10, 10))
+            ax = plt.gca()
+
+            dg = init_sim_obs.dg_scenario
+
+            # 1) Obstacles + boundaries
+            for obs in dg.static_obstacles:
+                geom = obs.shape if hasattr(obs, "shape") else obs.polygon
+
+                if geom.geom_type == "Polygon":
+                    x, y = geom.exterior.xy
+                else:
+                    # LinearRing or other types
+                    coords = list(geom.coords)
+                    x, y = zip(*coords)
+
+                plt.fill(x, y, color="lightgray", alpha=0.7, edgecolor="black")
+
+            # 2) Goals (yellow)
+            if goals is not None:
+                for gid, gobj in goals.items():
+                    poly = gobj.polygon
+
+                    if poly.geom_type == "Polygon":
+                        x, y = poly.exterior.xy
+                    else:
+                        coords = list(poly.coords)
+                        x, y = zip(*coords)
+
+                    plt.fill(x, y, color="gold", alpha=0.9, edgecolor="black")
+                    cx, cy = poly.centroid.x, poly.centroid.y
+                    plt.text(cx, cy, f"G{gid}", color="black",
+                            ha="center", va="center", fontsize=10)
+
+            # 3) Dropoff points (green)
+            if drops is not None:
+                for cp_id, cp in drops.items():
+                    poly = cp.polygon
+
+                    if poly.geom_type == "Polygon":
+                        x, y = poly.exterior.xy
+                    else:
+                        coords = list(poly.coords)
+                        x, y = zip(*coords)
+
+                    plt.fill(x, y, color="lightgreen", alpha=0.9, edgecolor="black")
+                    cx, cy = poly.centroid.x, poly.centroid.y
+                    plt.text(cx, cy, f"D{cp_id}", color="black",
+                            ha="center", va="center", fontsize=10)
+
+            # 4) Robot starting positions (blue)
+            for name, state in robots_states.items():
+                plt.plot(state.x, state.y, "bo", markersize=8)
+                plt.text(state.x, state.y, name, color="blue",
+                        ha="left", va="bottom", fontsize=10)
+
+            # 5) Trajectories (red)
+            for name, traj in trajectories.items():
+                if len(traj) > 0:
+                    xs = traj[:, 0]
+                    ys = traj[:, 1]
+                    plt.plot(xs, ys, "r-", linewidth=2)
+                    plt.plot(xs[0], ys[0], "ro", markersize=5)  # start point
+
+            # 6) Final figure settings
+            plt.title("DEBUG MAP — Obstacles, Robots, Goals, Dropoffs, Trajectories")
+            plt.xlabel("X")
+            plt.ylabel("Y")
+            plt.gca().set_aspect("equal", adjustable="box")
+            plt.grid(True)
+
+            plt.savefig("debug_map.png", dpi=200)
+            plt.close()
+
+            print("Saved debug map to debug_map.png\n")
+
 
         # but keep in mind that this could be a bottle neck for high number of robots/goals
         # frist sample points, create grid
