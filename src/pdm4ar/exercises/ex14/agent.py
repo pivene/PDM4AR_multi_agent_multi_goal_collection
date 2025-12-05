@@ -3,7 +3,7 @@ import random
 from dataclasses import dataclass
 from re import A
 from turtle import position
-from typing import Mapping, Sequence, List, Dict
+from typing import Mapping, Optional, Sequence, List, Dict
 import math
 from math import inf
 from shapely.geometry.base import BaseGeometry
@@ -12,7 +12,7 @@ import heapq
 import dg_commons
 import numpy as np
 from dg_commons import PlayerName
-from dg_commons.sim import InitSimGlobalObservations, InitSimObservations, SharedGoalObservation, SimObservations
+from dg_commons.sim import InitSimGlobalObservations, InitSimObservations, SharedGoalObservation, SimObservations, PlayerObservations
 from dg_commons.sim.agents import Agent, GlobalPlanner
 from dg_commons.sim.goals import PlanningGoal
 from dg_commons.sim.models.diff_drive import DiffDriveCommands
@@ -47,19 +47,45 @@ class Pdm4arAgent(Agent):
 
     # previous_state: #need to understand the type of this!!!!!!
     def __init__(self, res: float = 0.1, robot_radius: float = 0.6):
-        # feel free to remove/modify  the following
+        # basic parameters
         self.params = Pdm4arAgentParams()
         self.res = res
         self.robot_radius = robot_radius
 
+        # trajectory following
+        self.trajectory = None
+        self.point = 0
+
+        # PD controller memory
+        self.prev_ang_err = 0.0
+
+        # environment and agent identifiers
+        self.priority: Optional[int] = None
+        self.static_obstacles: Sequence[StaticObstacle] = []
+
+        # if true the robot is done with his assignment, the robot is in idle and can still move out of the way if necessary
+        self.done = False
+
     def on_episode_init(self, init_sim_obs: InitSimObservations):
         # called at the beginning of the simulation
         # in init_sim_obs there are name, seed, boundaries, static obstacles, robot geometry, model parameters
-        # estrarre i parametri e assegnarli alle variabili di classe
+
+        # robot geometry and dynmaic parameters
         self.sg = init_sim_obs.model_geometry
         self.sp = init_sim_obs.model_params
         self.name = init_sim_obs.my_name
-        self.prev_ang_err = 0.0
+
+        # static obstacles
+        if init_sim_obs.dg_scenario is not None:
+            self.static_obstacles = init_sim_obs.dg_scenario.static_obstacles
+        
+        # extract number from robot name to assign to priority, the priority is used to decide which robot should move first if they are about to collide
+        name_str = str(self.name)
+        parts = name_str.split("_")
+        if len(parts) >= 2 and parts[-1].isdigit():
+            self.priority = int(parts[-1])
+        else:
+            self.priority = 999 # assign very low priority if name fails
 
         pass
 
@@ -80,6 +106,155 @@ class Pdm4arAgent(Agent):
         # set point counters
         self.point = 0
 
+    def is_pose_free(self, x: float, y: float, other_players: Mapping[PlayerName, PlayerObservations], min_robot_dist: float = 0.5) -> bool:
+        """
+        Check if a robot placed would collide with an obstacle or be too close to another robot.
+        """
+        # check static obstacles
+        disc = ShPoint(x, y).buffer(self.robot_radius)
+        for obs in self.static_obstacles:
+            geom = getattr(obs, "shape", None)
+            if geom is None:
+                continue
+            if disc.intersects(geom):
+                return False
+
+        # check distance to other robots
+        for other_name, other_obs in other_players.items():
+            if other_name == self.name:
+                continue
+            ox = other_obs.state.x
+            oy = other_obs.state.y
+            if math.hypot(ox - x, oy - y) < min_robot_dist:
+                return False
+
+        return True
+
+    def choose_avoidance_velocity(self, x: float, y: float, psi: float, sim_obs: SimObservations) -> tuple[float, float]:
+        """
+        Avoidance behavior for the robot with lower priority or for robot in emergency case (if they are too close).
+        Returns v_cmd, w_cmd in robot frame.
+        """
+        players = sim_obs.players
+
+        # step for probing candidate poses
+        step_dist = 0.5
+
+        # speed for the movement
+        v_forward = 0.6
+        v_backward = -0.8
+        w_turn = 1.0
+
+        # point behind the robot to move out of the way (backward pose)
+        bx = x - step_dist * math.cos(psi)
+        by = y - step_dist * math.sin(psi)
+
+        # try to back up
+        if self.is_pose_free(bx, by, players):
+            return v_backward, 0.0 
+
+        # left/right sidestep poses
+        lx = x - step_dist * math.sin(psi)
+        ly = y + step_dist * math.cos(psi)
+        rx = x + step_dist * math.sin(psi)
+        ry = y - step_dist * math.cos(psi) 
+
+        # try sidestep left
+        if self.is_pose_free(lx, ly, players): 
+            return v_forward, +w_turn
+        
+        # try sidestep right
+        if self.is_pose_free(rx, ry, players):
+            return v_forward, -w_turn
+
+        # if the robot is fully blocked it will rotate in place to search for another way out
+        return 0.0, w_turn
+
+    def idle_avoidance_velocity(self, x: float, y: float, psi: float, sim_obs: SimObservations) -> tuple[float, float]:
+        """
+        Idle behavior for the robot, meaning the robot has finished all his tasks and is waiting.
+        If another robot is coming it should move away from it in the opposite direction.
+        Returns v_cmd, w_cmd in robot frame.
+        """
+        players = sim_obs.players
+
+        # find closest robot
+        closest = None
+        closest_d = float("inf")
+        for other_name, other_obs in players.items():
+            if other_name == self.name:
+                continue
+            ox = other_obs.state.x
+            oy = other_obs.state.y
+            d = math.hypot(ox - x, oy - y)
+            if d < closest_d:
+                closest_d = d
+                closest = other_obs.state
+
+        if closest is None:
+            # if nobody is nearby then dont move
+            return 0.0, 0.0
+
+        # vector away from the other robot
+        dx = x - closest.x
+        dy = y - closest.y
+
+        escape_angle = math.atan2(dy, dx)
+
+        # candidate directions:
+        primary_dir = escape_angle
+        left_dir = escape_angle + math.pi/2
+        right_dir = escape_angle - math.pi/2
+
+        # helper: compute (v,w) to move toward a desired global heading
+        def control_to_heading(target_angle):
+            angle_error = math.atan2(math.sin(target_angle - psi), math.cos(target_angle - psi))
+            kp_ang = 2.0
+            w = kp_ang * angle_error
+            # move only when roughly aligned
+            v = 1.0 if abs(angle_error) < 0.01 else 0.0
+            return v, w
+
+        # step size to test occupancy
+        step = 0.5
+
+        # primary escape route
+        ex = x + step * math.cos(primary_dir)
+        ey = y + step * math.sin(primary_dir)
+
+        if self.is_pose_free(ex, ey, players):
+            return control_to_heading(primary_dir)
+
+        # left escape route
+        lx = x + step * math.cos(left_dir)
+        ly = y + step * math.sin(left_dir)
+
+        if self.is_pose_free(lx, ly, players):
+            return control_to_heading(left_dir)
+
+        # right escape route
+        rx = x + step * math.cos(right_dir)
+        ry = y + step * math.sin(right_dir)
+
+        if self.is_pose_free(rx, ry, players):
+            return control_to_heading(right_dir)
+
+        # if everything is blocked, spin to find a way out
+        return 0.0, 1.0
+
+    def vw_to_wheels(self, v, w):
+        R = self.sg.wheelradius
+        L = self.sg.wheelbase
+        w_min, w_max = self.sp.omega_limits
+
+        omega_r = (v + (w * L / 2)) / R
+        omega_l = (v - (w * L / 2)) / R
+
+        omega_r = max(min(omega_r, w_max), w_min)
+        omega_l = max(min(omega_l, w_max), w_min)
+
+        return DiffDriveCommands(omega_l=omega_l, omega_r=omega_r)
+
     def get_commands(self, sim_obs: SimObservations) -> DiffDriveCommands:
         """This method is called by the simulator every dt_commands seconds (0.1s by default).
         Do not modify the signature of this method.
@@ -89,6 +264,71 @@ class Pdm4arAgent(Agent):
         :param sim_obs:
         :return:
         """
+        # AVOIDANCE: detect robots that are close
+        # extract the observation of other robots
+        players = sim_obs.players
+        # extract the state
+        current_state = players[self.name].state
+        x = current_state.x
+        y = current_state.y
+        psi = current_state.psi
+        # distance where one robot starts to get out of the way
+        danger_dist = 2
+        # distance where robot with higher priority should stop to avoid collision
+        emergency_dist = 1.3
+        speed_factor = 1
+
+        # check if a robot is nearby
+        danger_robot_name = None
+        min_dist = float("inf")
+
+        for other_name, other_obs in players.items():
+            if other_name == self.name:
+                continue
+
+            ox = other_obs.state.x
+            oy = other_obs.state.y
+            d = math.hypot(ox - x, oy - y)
+
+            if d < min_dist:
+                min_dist = d
+                danger_robot_name = other_name
+        
+        # if robot is found, decide priority
+        if danger_robot_name is not None:
+            # determine the priority
+            name_str = str(danger_robot_name)
+            parts = name_str.split("_")
+            if len(parts) >= 2 and parts[-1].isdigit():
+                other_prio = int(parts[-1])
+            else:
+                other_prio = 9999
+            low_prio_robot = (self.priority > other_prio)
+            dist = min_dist
+
+            # check if robot is in idle
+            if self.done:
+                # case 1: both robots are in idle so both have the priority 9999 and they should do nothing
+                if self.priority == other_prio:
+                    return DiffDriveCommands(omega_l=0, omega_r=0)
+                # case 2: robot is in idle but priorities are not equal, in that case move away from the other robot
+                if dist < danger_dist:
+                    v_avoid, w_avoid = self.idle_avoidance_velocity(x, y, psi, sim_obs)
+                    return self.vw_to_wheels(v_avoid, w_avoid)
+
+            # low priority robot tries to avoid the other robot
+            if low_prio_robot and (dist < danger_dist):
+                v_avoid, w_avoid = self.choose_avoidance_velocity(x, y, psi, sim_obs)
+                return self.vw_to_wheels(v_avoid, w_avoid)
+            
+            # high priority robot only stops if he gets closer than emergency distance
+            else:
+                if dist < emergency_dist:
+                    return self.vw_to_wheels(0.0, 0.0)
+
+                # if not in emergency distance high priority robot slows a bit but keeps going
+                speed_factor = 0.5
+
         if not hasattr(self, "trajectory") or self.trajectory is None:
             # initial check if a trajectory exist
             return DiffDriveCommands(omega_l=0, omega_r=0)
@@ -98,16 +338,8 @@ class Pdm4arAgent(Agent):
         kd_angular = 0.1
         dist_tolerance = 0.05
         ang_tolerance = 0.05
-        R = self.sg.wheelradius  # radius of wheels
-        L = self.sg.wheelbase  # distance between wheels
-        # constant terms for the PD control
-        w_min, w_max = self.sp.omega_limits
         t = sim_obs.time
-        current_state = sim_obs.players[self.name].state
-        # extract the state, it should work even if it doesnt seem
-        x = current_state.x
-        y = current_state.y
-        psi = current_state.psi
+        
         if t < 1e-8:
             # initialize the previus state as current state at the initial timestep, we could initialize to zero but i don't know how to do it
             self.previous_state = current_state
@@ -118,6 +350,9 @@ class Pdm4arAgent(Agent):
 
         # now i have to make the robot follow the trajectory
         if self.point == len(self.trajectory):
+            # robot is in idle so it will move out of the way if needed
+            self.done = True
+            self.priority = 9999
             return DiffDriveCommands(omega_l=0, omega_r=0)  # stop the robot if we arrived to the last point
 
         target = self.trajectory[self.point]  # (x_target, y_target, psi_target)
@@ -159,23 +394,11 @@ class Pdm4arAgent(Agent):
         self.prev_ang_err = relevant_angular_error
         w_cmd = (kp_angular * relevant_angular_error) + (kd_angular * error_derivative)
 
-        omega_r = (v_cmd + (w_cmd * L / 2)) / R
-        omega_l = (v_cmd - (w_cmd * L / 2)) / R
-        # Clamp the values in order to don't avoid the constarints
-        if omega_r < w_min:
-            omega_r = w_min
+        # adjust the speed if necessary
+        v_cmd *= speed_factor
 
-        if omega_l < w_min:
-            omega_l = w_min
-
-        if omega_r > w_max:
-            omega_r = w_max
-
-        if omega_l > w_max:
-            omega_l = w_max
-
-        return DiffDriveCommands(omega_l=omega_l, omega_r=omega_r)
-
+        commands = self.vw_to_wheels(v_cmd, w_cmd)
+        return commands
 
 class Pdm4arGlobalPlanner(GlobalPlanner):
     """
@@ -567,11 +790,6 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
                 cost_matrix[i, j] = self.path_cost(path_rg)  # + goal_drop_cost[g]
                 paths_rg[(r, g)] = path_rg
-
-        if True:
-            print("Robots:", robots_sorted)
-            print("Goals:", goals_sorted)
-            print("Cost matrix:\n", cost_matrix)
 
         # use optimizer for first assignment
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
