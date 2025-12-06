@@ -76,11 +76,21 @@ class Pdm4arAgent(Agent):
         # example
 
         # save trajectory
-        self.trajectory = global_plan.trajectories[str(self.name)]
-        self.goals = global_plan.goals
+        raw_trajectory = global_plan.trajectories[str(self.name)]
+        traj = []
+        for i in range(1, len(raw_trajectory)):  # make trajectory more dense to make it follow the path correctly
+            start = raw_trajectory[i - 1]
+            end = raw_trajectory[i]
+            new = np.linspace(start, end, 40, endpoint=False)
+            for j in range(1, 40):
+                traj.append(np.array([new[j][0], new[j][1], start[2]]))
+        traj.append(raw_trajectory[-1])
+        self.trajectory = traj
+        self.goals = global_plan.goals[str(self.name)]
         self.target = None
         # set point counters
-        self.point = 0
+        self.current_traj_idx = 0
+        self.current_goal_idx = 0
 
     def get_commands(self, sim_obs: SimObservations) -> DiffDriveCommands:
         """This method is called by the simulator every dt_commands seconds (0.1s by default).
