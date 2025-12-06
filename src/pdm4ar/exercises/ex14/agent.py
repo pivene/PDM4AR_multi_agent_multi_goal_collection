@@ -516,23 +516,26 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
         # convert dropoff to grid
         # so map each dropoff ID to its grid cell location
-        drop_grid = []
+        drop_grid = {}
         if drops is not None:
             for cp_id, cp in sorted(drops.items()):
                 xd, yd = centre_of_poly(cp.polygon)
                 g = self.world_to_grid(xd, yd)
                 if g is not None:
-                    drop_grid.append(g)
+                    drop_grid[cp_id] = g
 
         # precompute goal to nearest drop off
         goal_drop_cost = {}
         goal_drop_path = {}
+        goal_clusters = {d: [] for d in drop_grid.keys()}
+        goal_drop_id = {}
 
         for gid, gpos in goal_grid.items():
             best_cost = float("inf")
             best_path = None
+            best_drop_id = None
 
-            for dpos in drop_grid:
+            for drop_id, dpos in drop_grid.items():
                 p = self.astar(gpos, dpos)
                 if p is None:
                     continue
@@ -540,13 +543,192 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 if c < best_cost:
                     best_cost = c
                     best_path = p
+                    best_drop_id = drop_id
+
             goal_drop_cost[gid] = best_cost
             goal_drop_path[gid] = best_path
-            if best_path is None:
+            goal_drop_id[gid] = best_drop_id
+            if best_drop_id is not None and best_path is not None:
+                goal_clusters[best_drop_id].append(gid)
+            else:
+                # unreachable goal
                 goal_drop_cost[gid] = float("inf")
                 goal_drop_path[gid] = None
+                goal_drop_id[gid] = None
 
-        # build cost matrix for robots to goals
+        robots_sorted = sorted(robot_grid.keys())
+        drops_sorted = sorted(drop_grid.keys())
+        goals_sorted = sorted(goal_grid.keys())
+
+        # apply hungarian to assign to each drop-off a single robot, ie the one closest the dropoff
+        num_r = len(robots_sorted)
+        num_d = len(drops_sorted)
+        cost_matrix = np.full((num_r, num_d), np.inf)
+        paths_rd: dict[tuple[str, int], list[tuple[int, int]]] = {}
+
+        for i, r in enumerate(robots_sorted):
+            for j, d in enumerate(drops_sorted):
+                start = robot_grid[r]
+                dpos = drop_grid[d]
+                path_rd = self.astar(start, dpos)
+                if path_rd is None:
+                    continue
+                c = self.path_cost(path_rd)
+                cost_matrix[i, j] = c
+                paths_rd[(r, d)] = path_rd
+
+        finite_rows = np.any(np.isfinite(cost_matrix), axis=1)
+        finite_cols = np.any(np.isfinite(cost_matrix), axis=0)
+
+        row_ind_base: list[int] = []
+        col_ind_base: list[int] = []
+
+        if finite_rows.any() and finite_cols.any():
+            row_ids = [i for i, ok in enumerate(finite_rows) if ok]
+            col_ids = [j for j, ok in enumerate(finite_cols) if ok]
+            cost_sub = cost_matrix[finite_rows][:, finite_cols]
+            sub_row_ind, sub_col_ind = linear_sum_assignment(cost_sub)
+            row_ind_base = [row_ids[i] for i in sub_row_ind]
+            col_ind_base = [col_ids[j] for j in sub_col_ind]
+
+        # actual one-to-one assignment: to each drop-off locations, we assign a single robot
+        drop_to_robot: dict[int, str] = {}
+        for i, j in zip(row_ind_base, col_ind_base):
+            if not np.isfinite(cost_matrix[i, j]):
+                continue
+            r = robots_sorted[i]
+            d = drops_sorted[j]
+            drop_to_robot[d] = r
+
+        # but actually we want all drop-offs to be exploited. Thus, here we assign the
+        # drop-offs left to the closest robot
+        for j, d in enumerate(drops_sorted):
+            # if d in drop_to_robot, that drop-off has already been assigned to a robot
+            if d in drop_to_robot:
+                continue
+            best_i = None
+            best_cost = float("inf")
+            for i, r in enumerate(robots_sorted):
+                c = cost_matrix[i, j]
+                if np.isfinite(c) and c < best_cost:
+                    best_cost = c
+                    best_i = i
+            if best_i is not None:
+                r = robots_sorted[best_i]
+                drop_to_robot[d] = r
+
+        # now we keep account of the fact that to a robot multiple drop-offs can be assigned
+        # ans thus we link each robot to all the drop-offs it has been assigned to
+        robot_to_drops = {r: [] for r in robots_sorted}
+        for d, r in drop_to_robot.items():
+            robot_to_drops[r].append(d)
+
+        # now we have to build the plan for each robot, but we want to abandon the drop-off-focused
+        # logic: if a robot has multiple dropoffs assigned, it must not care of what drop off it is
+        # assigned to, but just optimize its trajectory over all goals that are indirectly assigned to it
+        robot_goals: dict[str, list[int]] = {r: [] for r in robots_sorted}
+        for r in robots_sorted:
+            for d in robot_to_drops[r]:
+                robot_goals[r].extend(goal_clusters[d])
+
+        robot_paths = {r: [] for r in robots_sorted}
+        robot_current_pos = {}
+        for r in robots_sorted:
+            robot_current_pos[r] = robot_grid[r]
+            goals_for_r = robot_goals[r]
+            # no goals assigned to this robot
+            if not goals_for_r:
+                continue
+
+            while goals_for_r:
+                best_gid = None
+                best_path_rg = None
+                best_cost = float("inf")
+
+                for gid in list(goals_for_r):
+                    drop_id = goal_drop_id.get(gid)
+                    if drop_id is None:
+                        continue
+                    if goal_drop_path[gid] is None:
+                        continue
+                    gpos = goal_grid[gid]
+                    path_rg = self.astar(robot_current_pos[r], gpos)
+                    if path_rg is None:
+                        continue
+
+                    cost_rg = self.path_cost(path_rg)
+                    if cost_rg < best_cost:
+                        best_cost = cost_rg
+                        best_gid = gid
+                        best_path_rg = path_rg
+                if best_gid is None:
+                    # no reachable remaining goal for this robot
+                    break
+
+                if not robot_paths[r]:
+                    # if it's the first path, take teh full trajectory
+                    robot_paths[r].extend(best_path_rg)
+                else:
+                    # if it's not the first path, don't take the first cell (drop-off) to avoid duplicates
+                    robot_paths[r].extend(best_path_rg[1:])
+                g2d = goal_drop_path[best_gid]
+                robot_paths[r].extend(g2d[1:])
+                robot_current_pos[r] = g2d[-1]
+                goals_for_r.remove(best_gid)
+
+        # old clustering
+        """ robot_clusters = {}
+        for d in drops_sorted:
+            best_r = None
+            best_cost = float("inf")
+            for r in robots_sorted:
+                path_rd = self.astar(robot_grid[r], drop_grid[d])
+                if path_rd is None:
+                    continue
+                cost_rd = self.path_cost(path_rd)
+                if cost_rd < best_cost:
+                    best_cost = cost_rd
+                    best_r = r
+            if best_r is not None:
+                robot_clusters[d] = (
+                    best_r  ######## must enforce that a single robot can't be assigned to multiple drop offs
+                )
+        #### but then, the end, if there
+
+        # for each cluster, compute the optimal path for the robot
+        robot_paths = {r: [] for r in robots_sorted}
+        robot_current_pos = {}
+        for d in drops_sorted:
+            r = robot_clusters[d]
+            robot_current_pos[r] = robot_grid[r]
+
+            cluster_goals = goal_clusters[d]
+            while cluster_goals:
+                best_path = None
+                best_cost = float("inf")
+                best_goal = None
+
+                for gid in cluster_goals:
+                    gpos = goal_grid[gid]
+                    path_rg = self.astar(robot_current_pos[r], gpos)
+                    if path_rg is None or goal_drop_path[gid] is None:
+                        continue
+                    cost_rg = self.path_cost(path_rg)
+                    if cost_rg < best_cost:
+                        best_cost = cost_rg
+                        best_path = path_rg
+                        best_goal = gid
+                if best_goal is None:
+                    break
+
+                robot_paths[r].extend(best_path)
+                robot_paths[r].extend(goal_drop_path[best_goal][1:])
+                robot_current_pos[r] = goal_drop_path[best_goal][-1]
+                # remove goal just assigned to the cluster
+                cluster_goals.remove(best_goal)"""
+
+        # no clustering
+        """# build cost matrix for robots to goals
         robots_sorted = sorted(robot_grid.keys())
         goals_sorted = sorted(goal_grid.keys())
         num_r = len(robots_sorted)
@@ -719,7 +901,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 pts = [ShPoint(x, y) for x, y in zip(X.ravel(), Y.ravel())]
                 mask = np.array([disc.covers(p) for p in pts], dtype=bool).reshape(len(ys), len(xs))
 
-                self.grid[cell_min_y : cell_max_y + 1, cell_min_x : cell_max_x + 1] |= mask
+                self.grid[cell_min_y : cell_max_y + 1, cell_min_x : cell_max_x + 1] |= mask"""
 
         # convert grid paths to world trajectories
         trajectories = {}
