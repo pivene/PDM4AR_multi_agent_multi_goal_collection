@@ -25,6 +25,7 @@ from scipy.optimize import linear_sum_assignment
 
 class GlobalPlanMessage(BaseModel):
     trajectories: Dict[str, NDArray]  # for each robot assign a trajectory (as an array)
+    goals: Dict[str, NDArray]
 
 
 @dataclass(frozen=True)
@@ -76,7 +77,8 @@ class Pdm4arAgent(Agent):
 
         # save trajectory
         self.trajectory = global_plan.trajectories[str(self.name)]
-
+        self.goals = global_plan.goals
+        self.target = None
         # set point counters
         self.point = 0
 
@@ -631,6 +633,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             for d in robot_to_drops[r]:
                 robot_goals[r].extend(goal_clusters[d])
 
+        robot_target_goals = {r: [] for r in robots_sorted}
         robot_paths = {r: [] for r in robots_sorted}
         robot_current_pos = {}
         for r in robots_sorted:
@@ -674,6 +677,8 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 g2d = goal_drop_path[best_gid]
                 robot_paths[r].extend(g2d[1:])
                 robot_current_pos[r] = g2d[-1]
+                gx, gy = centre_of_poly(goals[best_gid].polygon)
+                robot_target_goals[r].append([gx, gy])
                 goals_for_r.remove(best_gid)
 
         # old clustering
@@ -905,12 +910,18 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
         # convert grid paths to world trajectories
         trajectories = {}
+        final_goals = {}
+        final_drops = {}
         for r in robots_sorted:
             cells = robot_paths[r]
             trajectories[r] = self.cells_to_waypoints(cells)
+            if len(robot_target_goals[r]) > 0:
+                final_goals[r] = np.array(robot_target_goals[r], dtype=float)
+            else:
+                final_goals[r] = np.zeros((0, 2), dtype=float)
 
         # build global plan message
-        global_plan_message = GlobalPlanMessage(trajectories=trajectories)
+        global_plan_message = GlobalPlanMessage(trajectories=trajectories, goals=final_goals)
 
         DEBUG = False
         if DEBUG:
