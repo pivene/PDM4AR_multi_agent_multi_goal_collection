@@ -75,31 +75,27 @@ class Pdm4arAgent(Agent):
         # You can deserialize it here and store the information for use during execution.
         # here i have to define global parameters to access than during the whole simulation
         # example
-        def adaptive_linear_oversampling(raw_traj, base=5, max_points=40):
+        def adaptive_linear_oversampling(raw_traj, base=5, max_points=20):
             raw = np.array(raw_traj)
             out = []
 
             for i in range(1, len(raw) - 1):
+                # take more points where i have more difficult angles
                 p_prev = raw[i - 1][:2]
                 p = raw[i][:2]
                 p_next = raw[i + 1][:2]
 
-                # vettori
                 v1 = p - p_prev
                 v2 = p_next - p
 
-                # angolo tra i segmenti
                 cosang = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
                 cosang = np.clip(cosang, -1, 1)
                 ang = np.arccos(cosang)
 
-                # quanto la curva è “stretta": da 0 (diritta) a 1 (curva forte)
                 curvature = (np.pi - ang) / np.pi
 
-                # numero di oversample proporzionale alla curvatura
                 n_points = int(base + curvature * (max_points - base))
 
-                # densifica linearmente il segmento
                 seg = np.linspace(raw[i - 1], raw[i], n_points, endpoint=False)
                 for j in range(1, len(seg)):
                     out.append(seg[j])
@@ -174,9 +170,9 @@ class Pdm4arAgent(Agent):
             alpha = (alpha + math.pi) % (2 * math.pi) - math.pi
             v_cmd = -(w_max * R)
             # PD rotation in backward mode
-            alpha_dot = (alpha - self.last_alpha) / 0.1
-            self.last_alpha = alpha
-            w_cmd = KP_ROT * alpha + KD_ROT * alpha_dot
+
+            w_cmd = -(2 * v_cmd * math.sin(alpha)) / Ld
+
         else:
             alpha = alpha_fwd
             v_cmd = w_max * R
