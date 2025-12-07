@@ -567,7 +567,8 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         drops_sorted = sorted(drop_grid.keys())
         goals_sorted = sorted(goal_grid.keys())
 
-        # apply hungarian to assign to each drop-off a single robot, ie the one closest to the closest goal in the dropoff's cluster
+        # apply hungarian to assign to each drop-off a single robot, keeping account of the
+        # distance to goal in the dropoff's cluster + the distance from that goal to the dropoff
         num_r = len(robots_sorted)
         num_d = len(drops_sorted)
         cost_matrix = np.full((num_r, num_d), np.inf)
@@ -582,10 +583,19 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 if goals_in_cluster:
                     for gid in goals_in_cluster:
                         gpos = goal_grid[gid]
+                        # distance robot-goal
                         path_rg = self.astar(start, gpos)
                         if path_rg is None:
                             continue
-                        c = self.path_cost(path_rg)
+                        c_rg = self.path_cost(path_rg)
+                        # distance goal-dropoff
+                        dpos = drop_grid[d]
+                        path_gd = self.astar(gpos, dpos)
+                        if path_gd is None:
+                            continue
+                        c_gd = self.path_cost(path_gd)
+                        # total cost
+                        c = c_rg + c_gd
                         if c < best_cost:
                             best_cost = c
                 else:
