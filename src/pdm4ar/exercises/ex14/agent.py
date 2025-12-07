@@ -567,22 +567,36 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         drops_sorted = sorted(drop_grid.keys())
         goals_sorted = sorted(goal_grid.keys())
 
-        # apply hungarian to assign to each drop-off a single robot, ie the one closest the dropoff
+        # apply hungarian to assign to each drop-off a single robot, ie the one closest to the closest goal in the dropoff's cluster
         num_r = len(robots_sorted)
         num_d = len(drops_sorted)
         cost_matrix = np.full((num_r, num_d), np.inf)
-        paths_rd: dict[tuple[str, int], list[tuple[int, int]]] = {}
 
         for i, r in enumerate(robots_sorted):
+            start = robot_grid[r]
             for j, d in enumerate(drops_sorted):
-                start = robot_grid[r]
-                dpos = drop_grid[d]
-                path_rd = self.astar(start, dpos)
-                if path_rd is None:
-                    continue
-                c = self.path_cost(path_rd)
-                cost_matrix[i, j] = c
-                paths_rd[(r, d)] = path_rd
+                goals_in_cluster = goal_clusters[d]
+
+                best_cost = float("inf")
+
+                if goals_in_cluster:
+                    for gid in goals_in_cluster:
+                        gpos = goal_grid[gid]
+                        path_rg = self.astar(start, gpos)
+                        if path_rg is None:
+                            continue
+                        c = self.path_cost(path_rg)
+                        if c < best_cost:
+                            best_cost = c
+                else:
+                    # if the dropoff's cluster is empty, we assign a robot to it based on tghe distance to the dropoff itslef
+                    dpos = drop_grid[d]
+                    path_rd = self.astar(start, dpos)
+                    if path_rd is not None:
+                        best_cost = self.path_cost(path_rd)
+
+                if best_cost < float("inf"):
+                    cost_matrix[i, j] = best_cost
 
         finite_rows = np.any(np.isfinite(cost_matrix), axis=1)
         finite_cols = np.any(np.isfinite(cost_matrix), axis=0)
@@ -599,7 +613,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             col_ind_base = [col_ids[j] for j in sub_col_ind]
 
         # actual one-to-one assignment: to each drop-off locations, we assign a single robot
-        drop_to_robot: dict[int, str] = {}
+        drop_to_robot = {}
         for i, j in zip(row_ind_base, col_ind_base):
             if not np.isfinite(cost_matrix[i, j]):
                 continue
@@ -637,6 +651,84 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         for r in robots_sorted:
             for d in robot_to_drops[r]:
                 robot_goals[r].extend(goal_clusters[d])
+
+        # here we implement a logic to balance the workload of each robot. Each time we compare two robots: if the number
+        # of goals assigned to one is greater than the other +1, the goal of of the overloaded robot which is closest to the other
+        # one passes to the latter.
+        # Moreover, we also check that the distance of the candidate goal to be moved, from its new drop-off, is not too
+        # greater than the of the distance to its past dropoff
+        for r1 in robots_sorted:
+            goals_for_r1 = robot_goals[r1]
+            if not goals_for_r1:
+                continue
+            for r2 in robots_sorted:
+                if r1 == r2:
+                    continue
+                goals_for_r2 = robot_goals[r2]
+                if not goals_for_r2:
+                    continue
+                # r1 has more goals than r2
+                if len(goals_for_r1) > len(goals_for_r2) + 1:
+                    closest_goal = None
+                    best_cost = float("inf")
+                    for goal1 in goals_for_r1:
+                        # first of all, compute the distance of the goal to its potential new drop off
+                        best_new_drop = float("inf")
+                        for d in robot_to_drops[r2]:
+                            key = (goal1, d)
+                            if key in goal_drop_costs_all:
+                                dist_g_d_new = goal_drop_costs_all[key]
+                                if dist_g_d_new < best_new_drop:
+                                    best_new_drop = dist_g_d_new
+                        if best_new_drop == float("inf"):
+                            continue
+                        # base_dist is the distance between this goal and its closest drop-off, in general
+                        base_dist = goal_drop_cost[goal1]
+                        # with the following condition, we consider to move only goals whose new dropoff is not too worse from the previous one
+                        if best_new_drop > 1.5 * base_dist:
+                            continue
+                        # here, for each goal of r1, we compute the distance to r2, and the closest one is moved from r1 to r2
+                        path = self.astar(robot_grid[r2], goal_grid[goal1])
+                        if path is None:
+                            continue
+                        cost = self.path_cost(path)
+                        if cost < best_cost:
+                            best_cost = cost
+                            closest_goal = goal1
+                    if closest_goal is not None:
+                        robot_goals[r1].remove(closest_goal)
+                        robot_goals[r2].append(closest_goal)
+                # r2 has more goals than r1
+                elif len(goals_for_r2) > len(goals_for_r1) + 1:
+                    closest_goal = None
+                    best_cost = float("inf")
+                    for goal2 in goals_for_r2:
+                        # first of all, compute the distance of the goal to its potential new drop off
+                        best_new_drop = float("inf")
+                        for d in robot_to_drops[r1]:
+                            key = (goal2, d)
+                            if key in goal_drop_costs_all:
+                                dist_g_d_new = goal_drop_costs_all[key]
+                                if dist_g_d_new < best_new_drop:
+                                    best_new_drop = dist_g_d_new
+                        if best_new_drop == float("inf"):
+                            continue
+                        # base_dist is the distance between this goal and its closest drop-off, in general
+                        base_dist = goal_drop_cost[goal2]
+                        # with the following condition, we consider to move only goals whose new dropoff is not too worse from the previous one
+                        if best_new_drop > 1.5 * base_dist:
+                            continue
+                        # here, for each goal of r2, we compute the distance to r1, and the closest one is moved from r2 to r1
+                        path = self.astar(robot_grid[r1], goal_grid[goal2])
+                        if path is None:
+                            continue
+                        cost = self.path_cost(path)
+                        if cost < best_cost:
+                            best_cost = cost
+                            closest_goal = goal2
+                    if closest_goal is not None:
+                        robot_goals[r2].remove(closest_goal)
+                        robot_goals[r1].append(closest_goal)
 
         robot_paths = {r: [] for r in robots_sorted}
         robot_current_pos = {}
