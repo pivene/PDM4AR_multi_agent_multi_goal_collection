@@ -60,7 +60,6 @@ class Pdm4arAgent(Agent):
         self.sg = init_sim_obs.model_geometry
         self.sp = init_sim_obs.model_params
         self.name = init_sim_obs.my_name
-        self.prev_ang_err = 0.0
 
         pass
 
@@ -78,113 +77,100 @@ class Pdm4arAgent(Agent):
         # save trajectory
         raw_trajectory = global_plan.trajectories[str(self.name)]
         traj = []
-        for i in range(1, len(raw_trajectory)):  # make trajectory more dense to make it follow the path correctly
+        for i in range(1, len(raw_trajectory) - 1):  # make trajectory more dense to make it follow the path correctly
             start = raw_trajectory[i - 1]
             end = raw_trajectory[i]
-            new = np.linspace(start, end, 40, endpoint=False)
-            for j in range(1, 40):
-                traj.append(np.array([new[j][0], new[j][1], start[2]]))
+            new = np.linspace(start, end, 20, endpoint=False)
+            for j in range(1, 20):
+                traj.append(np.array([new[j][0], new[j][1], new[j][2]]))
         traj.append(raw_trajectory[-1])
         self.trajectory = traj
-        self.goals = global_plan.goals[str(self.name)]
-        self.target = None
-        # set point counters
-        self.current_traj_idx = 0
+        self.current_traj_idx = 0  # stores the pure pursuit point
         self.current_goal_idx = 0
+        self.goals = global_plan.goals[str(self.name)]
+        self.target_goal = False
+        self.inplace_rotation = False
+        self.last_alpha = 0  # for calculationg the d term
+        self.finished = False
 
     def get_commands(self, sim_obs: SimObservations) -> DiffDriveCommands:
-        """This method is called by the simulator every dt_commands seconds (0.1s by default).
-        Do not modify the signature of this method.
 
-        For instance, this is how you can get your current state from the observations:
-        my_current_state: DiffDriveState = sim_obs.players[self.name].state
-        :param sim_obs:
-        :return:
-        """
-        if not hasattr(self, "trajectory") or self.trajectory is None:
-            # initial check if a trajectory exist
-            return DiffDriveCommands(omega_l=0, omega_r=0)
-        dt = 0.1  # input data
-        kp_linear = 2.0
-        kp_angular = 4.0
-        kd_angular = 0.1
-        dist_tolerance = 0.05
-        ang_tolerance = 0.05
-        R = self.sg.wheelradius  # radius of wheels
-        L = self.sg.wheelbase  # distance between wheels
-        # constant terms for the PD control
+        # ---------- Parameters ----------
+        LOOKAHEAD_CRUISE = 0.3
+        KP_ROT = 4.0  # PD gains for rotation
+        KD_ROT = 0.3
+
+        goal = self.goals[self.current_goal_idx]
+
+        R = self.sg.wheelradius
+        L = self.sg.wheelbase
         w_min, w_max = self.sp.omega_limits
-        t = sim_obs.time
+
         current_state = sim_obs.players[self.name].state
-        # extract the state, it should work even if it doesnt seem
         x = current_state.x
         y = current_state.y
         psi = current_state.psi
-        if t < 1e-8:
-            # initialize the previus state as current state at the initial timestep, we could initialize to zero but i don't know how to do it
-            self.previous_state = current_state
-            self.point = 0  # initial point is the first on the list
-            return DiffDriveCommands(omega_l=0, omega_r=0)
+        gx, gy = goal[0], goal[1]
+        dg = math.hypot(gx - x, gy - y)
+
+        if dg < (LOOKAHEAD_CRUISE + 0.2):
+            LOOKAHEAD_CRUISE = 0.2
+            self.target_goal = True
+
+        if self.target_goal:
+            if dg > LOOKAHEAD_CRUISE:
+                self.target_goal = False
+                if self.current_goal_idx < len(self.goals) - 1:
+                    self.current_goal_idx += 1
+                else:
+                    self.current_goal_idx = len(self.goals) - 1  # stay on last goal
+
+        v_cmd = w_max * R
+
+        target_point = None
+        for i in range(self.current_traj_idx, len(self.trajectory)):
+            pt = self.trajectory[i]
+            d = math.sqrt((pt[0] - x) ** 2 + (pt[1] - y) ** 2)
+            if d >= LOOKAHEAD_CRUISE:
+                target_point = pt
+                self.current_traj_idx = i
+                break
+
+        if target_point is None:
+            target_point = self.trajectory[-1]
+
+        tx, ty = target_point[0], target_point[1]
+
+        Ld = math.hypot(tx - x, ty - y)
+
+        alpha = math.atan2(ty - y, tx - x) - psi
+        alpha = (alpha + math.pi) % (2 * math.pi) - math.pi  # normalize
+
+        if alpha > math.pi / 2 or alpha < -math.pi / 2:
+            self.inplace_rotation = True
+
+        if self.inplace_rotation:
+            alpha_error = alpha
+            alpha_dot = (alpha_error - self.last_alpha) / 0.1
+            self.last_alpha = alpha_error
+            w_cmd = KP_ROT * alpha_error + KD_ROT * alpha_dot
+            v_cmd = 0.0
+            if abs(alpha_error) < 0.15:
+                self.inplace_rotation = False
         else:
-            self.previous_time = t
+            # normal pure pursuit curvature command
+            w_cmd = (2 * v_cmd * math.sin(alpha)) / Ld
 
-        # now i have to make the robot follow the trajectory
-        if self.point == len(self.trajectory):
-            return DiffDriveCommands(omega_l=0, omega_r=0)  # stop the robot if we arrived to the last point
+        omega_r = (v_cmd + (w_cmd * L / 2.0)) / R
+        omega_l = (v_cmd - (w_cmd * L / 2.0)) / R
 
-        target = self.trajectory[self.point]  # (x_target, y_target, psi_target)
-        x_goal = target[0]
-        y_goal = target[1]
-        psi_goal = target[2]
+        abs_limit = max(abs(w_min), abs(w_max))
+        max_mag = max(abs(omega_r), abs(omega_l))
 
-        dx = x_goal - x
-        dy = y_goal - y
-        distance = math.sqrt(dx**2 + dy**2)  # distance from the target
-        heading_to_point = math.atan2(dy, dx)  # check if i am heading to the point
-        normalize = lambda angle: math.atan2(math.sin(angle), math.cos(angle))  # clamp angles between [-pi, pi]
-        alpha = normalize(
-            heading_to_point - psi
-        )  # normailzed error to check if i am heading to the goal --> this could be not relevant, it is if we d
-        beta = normalize(psi_goal - psi)  # normailzed error to check if i am heading to the target angle
-        # implement a state machine to control
-        # case 1 : heading error > 0 --> means have to head in the right direction
-        if distance > dist_tolerance:  # if i am not in the point
-            if abs(alpha) > ang_tolerance:  # it might be that i am not aligned to it
-                v_cmd = 0.0
-                relevant_angular_error = alpha  # and so I have to first align to it
-            else:
-                v_cmd = kp_linear * distance  # or I might want to move on the straight line to get to the point
-                relevant_angular_error = alpha
-        else:  # i only need to get the right angular position
-            if abs(beta) > ang_tolerance:  # in this case i need to rotate to reach the right angular position
-                v_cmd = 0.0
-                relevant_angular_error = beta
-            else:
-                # Waypoint Reached! Move to next point
-                self.point += 1
-                return DiffDriveCommands(omega_l=0, omega_r=0)
-                # If we have more points, this logic will pick up next step
-                # For this step, just stop to be safe
-
-        # !!!! ERROR HERE WE HAVE TO UNDERSTAND HOW TO ACCESS TO A STATE !!!
-        error_derivative = (relevant_angular_error - self.prev_ang_err) / dt if dt > 0 else 0.0  # (x, y, psi)
-        self.prev_ang_err = relevant_angular_error
-        w_cmd = (kp_angular * relevant_angular_error) + (kd_angular * error_derivative)
-
-        omega_r = (v_cmd + (w_cmd * L / 2)) / R
-        omega_l = (v_cmd - (w_cmd * L / 2)) / R
-        # Clamp the values in order to don't avoid the constarints
-        if omega_r < w_min:
-            omega_r = w_min
-
-        if omega_l < w_min:
-            omega_l = w_min
-
-        if omega_r > w_max:
-            omega_r = w_max
-
-        if omega_l > w_max:
-            omega_l = w_max
+        if max_mag > abs_limit:
+            scale = abs_limit / max_mag
+            omega_r *= scale
+            omega_l *= scale
 
         return DiffDriveCommands(omega_l=omega_l, omega_r=omega_r)
 
