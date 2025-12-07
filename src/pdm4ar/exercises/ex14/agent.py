@@ -21,6 +21,7 @@ from dg_commons.sim.models.obstacles import StaticObstacle
 from numpydantic import NDArray
 from pydantic import BaseModel
 from scipy.optimize import linear_sum_assignment
+from scipy.interpolate import splprep, splev
 
 
 class GlobalPlanMessage(BaseModel):
@@ -69,108 +70,129 @@ class Pdm4arAgent(Agent):
     ):
         # TO DO: process here the received global plan
         global_plan = GlobalPlanMessage.model_validate_json(serialized_msg)
+
         # This method receives the dictionary of strings returned by the global planner’s send_plan(...) method.
         # You can deserialize it here and store the information for use during execution.
         # here i have to define global parameters to access than during the whole simulation
         # example
+        def adaptive_linear_oversampling(raw_traj, base=5, max_points=40):
+            raw = np.array(raw_traj)
+            out = []
 
-        # save trajectory
+            for i in range(1, len(raw) - 1):
+                p_prev = raw[i - 1][:2]
+                p = raw[i][:2]
+                p_next = raw[i + 1][:2]
+
+                # vettori
+                v1 = p - p_prev
+                v2 = p_next - p
+
+                # angolo tra i segmenti
+                cosang = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+                cosang = np.clip(cosang, -1, 1)
+                ang = np.arccos(cosang)
+
+                # quanto la curva è “stretta": da 0 (diritta) a 1 (curva forte)
+                curvature = (np.pi - ang) / np.pi
+
+                # numero di oversample proporzionale alla curvatura
+                n_points = int(base + curvature * (max_points - base))
+
+                # densifica linearmente il segmento
+                seg = np.linspace(raw[i - 1], raw[i], n_points, endpoint=False)
+                for j in range(1, len(seg)):
+                    out.append(seg[j])
+
+            out.append(raw[-1])
+            return np.array(out)
+
         raw_trajectory = global_plan.trajectories[str(self.name)]
-        traj = []
-        for i in range(1, len(raw_trajectory) - 1):  # make trajectory more dense to make it follow the path correctly
-            start = raw_trajectory[i - 1]
-            end = raw_trajectory[i]
-            new = np.linspace(start, end, 20, endpoint=False)
-            for j in range(1, 20):
-                traj.append(np.array([new[j][0], new[j][1], new[j][2]]))
-        traj.append(raw_trajectory[-1])
-        self.trajectory = traj
+        if len(raw_trajectory) >= 2:
+            self.trajectory = adaptive_linear_oversampling(raw_trajectory)
+        else:
+            self.trajectory = []
         self.current_traj_idx = 0  # stores the pure pursuit point
         self.current_goal_idx = 0
         self.goals = global_plan.goals[str(self.name)]
         self.target_goal = False
         self.inplace_rotation = False
         self.last_alpha = 0  # for calculationg the d term
-        self.finished = False
+        self.backwards = False
 
     def get_commands(self, sim_obs: SimObservations) -> DiffDriveCommands:
 
-        # ---------- Parameters ----------
-        LOOKAHEAD_CRUISE = 0.3
-        KP_ROT = 4.0  # PD gains for rotation
-        KD_ROT = 0.3
+        if self.trajectory is None or len(self.trajectory) == 0:
+            return DiffDriveCommands(omega_l=0.0, omega_r=0.0)
 
-        goal = self.goals[self.current_goal_idx]
+        LOOKAHEAD_CRUISE = 0.15
+        KP_ROT = 4.0
+        KD_ROT = 0.3
+        last_point = self.trajectory[-1]
 
         R = self.sg.wheelradius
         L = self.sg.wheelbase
         w_min, w_max = self.sp.omega_limits
 
-        current_state = sim_obs.players[self.name].state
-        x = current_state.x
-        y = current_state.y
-        psi = current_state.psi
-        gx, gy = goal[0], goal[1]
-        dg = math.hypot(gx - x, gy - y)
+        state = sim_obs.players[self.name].state
+        x = state.x
+        y = state.y
+        psi = state.psi
 
-        if dg < (LOOKAHEAD_CRUISE + 0.2):
-            LOOKAHEAD_CRUISE = 0.2
-            self.target_goal = True
+        dist_to_last = math.hypot(last_point[0] - x, last_point[1] - y)
 
-        if self.target_goal:
-            if dg > LOOKAHEAD_CRUISE:
-                self.target_goal = False
-                if self.current_goal_idx < len(self.goals) - 1:
-                    self.current_goal_idx += 1
-                else:
-                    self.current_goal_idx = len(self.goals) - 1  # stay on last goal
+        if dist_to_last < 0.1 and self.current_traj_idx > len(self.trajectory) - 3:
+            return DiffDriveCommands(omega_l=0.0, omega_r=0.0)
 
-        v_cmd = w_max * R
-
+        # pick lookahead target
         target_point = None
         for i in range(self.current_traj_idx, len(self.trajectory)):
-            pt = self.trajectory[i]
-            d = math.sqrt((pt[0] - x) ** 2 + (pt[1] - y) ** 2)
-            if d >= LOOKAHEAD_CRUISE:
-                target_point = pt
+            px, py = self.trajectory[i][0], self.trajectory[i][1]
+            if math.hypot(px - x, py - y) >= LOOKAHEAD_CRUISE:
+                target_point = (px, py)
                 self.current_traj_idx = i
                 break
-
         if target_point is None:
             target_point = self.trajectory[-1]
 
         tx, ty = target_point[0], target_point[1]
-
         Ld = math.hypot(tx - x, ty - y)
 
-        alpha = math.atan2(ty - y, tx - x) - psi
-        alpha = (alpha + math.pi) % (2 * math.pi) - math.pi  # normalize
+        # compute heading error
+        alpha_fwd = math.atan2(ty - y, tx - x) - psi
+        alpha_fwd = (alpha_fwd + math.pi) % (2 * math.pi) - math.pi
 
-        if alpha > math.pi / 2 or alpha < -math.pi / 2:
-            self.inplace_rotation = True
-
-        if self.inplace_rotation:
-            alpha_error = alpha
-            alpha_dot = (alpha_error - self.last_alpha) / 0.1
-            self.last_alpha = alpha_error
-            w_cmd = KP_ROT * alpha_error + KD_ROT * alpha_dot
-            v_cmd = 0.0
-            if abs(alpha_error) < 0.15:
-                self.inplace_rotation = False
+        # decide forward/backward
+        if abs(alpha_fwd) > math.pi / 2:
+            self.backwards = True
         else:
-            # normal pure pursuit curvature command
+            self.backwards = False
+
+        # recompute alpha in backward mode (use psi + pi)
+        if self.backwards:
+            alpha = math.atan2(ty - y, tx - x) - (psi + math.pi)
+            alpha = (alpha + math.pi) % (2 * math.pi) - math.pi
+            v_cmd = -(w_max * R)
+            # PD rotation in backward mode
+            alpha_dot = (alpha - self.last_alpha) / 0.1
+            self.last_alpha = alpha
+            w_cmd = KP_ROT * alpha + KD_ROT * alpha_dot
+        else:
+            alpha = alpha_fwd
+            v_cmd = w_max * R
             w_cmd = (2 * v_cmd * math.sin(alpha)) / Ld
 
+        # compute wheel speeds
         omega_r = (v_cmd + (w_cmd * L / 2.0)) / R
         omega_l = (v_cmd - (w_cmd * L / 2.0)) / R
 
-        abs_limit = max(abs(w_min), abs(w_max))
-        max_mag = max(abs(omega_r), abs(omega_l))
-
-        if max_mag > abs_limit:
-            scale = abs_limit / max_mag
-            omega_r *= scale
-            omega_l *= scale
+        # saturate
+        lim = max(abs(w_min), abs(w_max))
+        scale = max(abs(omega_r), abs(omega_l))
+        if scale > lim:
+            k = lim / scale
+            omega_r *= k
+            omega_l *= k
 
         return DiffDriveCommands(omega_l=omega_l, omega_r=omega_r)
 
