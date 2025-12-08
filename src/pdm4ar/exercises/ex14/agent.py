@@ -588,16 +588,8 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                         if path_rg is None:
                             continue
                         c_rg = self.path_cost(path_rg)
-                        # distance goal-dropoff
-                        dpos = drop_grid[d]
-                        path_gd = self.astar(gpos, dpos)
-                        if path_gd is None:
-                            continue
-                        c_gd = self.path_cost(path_gd)
-                        # total cost
-                        c = c_rg + c_gd
-                        if c < best_cost:
-                            best_cost = c
+                        if c_rg < best_cost:
+                            best_cost = c_rg
                 else:
                     # if the dropoff's cluster is empty, we assign a robot to it based on tghe distance to the dropoff itslef
                     dpos = drop_grid[d]
