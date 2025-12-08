@@ -82,7 +82,7 @@ class Pdm4arAgent(Agent):
             self.trajectory = raw_trajectory
         else:
             self.trajectory = []
-        self.current_traj_idx = 0  # stores the pure pursuit point
+        self.current_traj_idx = 0  # store the pure pursuit point
         self.backwards = False
 
     def get_commands(self, sim_obs: SimObservations) -> DiffDriveCommands:
